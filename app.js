@@ -49,6 +49,35 @@ const cacheManager = {
     }
 };
 
+// Rate limiting configuration
+const RATE_LIMIT = {
+    maxRequests: 50,  // Maximum requests per window
+    windowMs: 60000,  // Window size in milliseconds (1 minute)
+    requests: 0,
+    windowStart: Date.now()
+};
+
+// Rate limiting helper function
+async function checkRateLimit() {
+    const now = Date.now();
+    if (now - RATE_LIMIT.windowStart >= RATE_LIMIT.windowMs) {
+        // Reset window
+        RATE_LIMIT.requests = 0;
+        RATE_LIMIT.windowStart = now;
+    }
+    
+    if (RATE_LIMIT.requests >= RATE_LIMIT.maxRequests) {
+        // Calculate delay needed
+        const delayMs = RATE_LIMIT.windowMs - (now - RATE_LIMIT.windowStart) + 1000; // Add 1 second buffer
+        console.log(`Rate limit reached, waiting ${delayMs}ms`);
+        await new Promise(resolve => setTimeout(resolve, delayMs));
+        RATE_LIMIT.requests = 0;
+        RATE_LIMIT.windowStart = Date.now();
+    }
+    
+    RATE_LIMIT.requests++;
+}
+
 // Initialize database with optimized indices
 async function initializeDatabase() {
     db = await open({
@@ -103,17 +132,15 @@ async function addLogs(messages) {
         await stmt.finalize();
     }
 }
+
 function formatDateForSQLite(date) {
     return date.toISOString().replace('T', ' ').replace('Z', '');
 }
 
-// Helper function to convert SQLite timestamp to ISO string with timezone
 function convertSQLiteTimestamp(timestamp) {
-    // If timestamp is already in ISO format, return as is
     if (timestamp.includes('T') && timestamp.includes('Z')) {
         return timestamp;
     }
-    // Convert SQLite timestamp to ISO format
     return new Date(timestamp + 'Z').toISOString();
 }
 
@@ -157,7 +184,7 @@ const shopifyClient = axios.create({
     }
 });
 
-// Optimized fetch products with cursor-based pagination
+// Optimized fetch products with cursor-based pagination and rate limiting
 async function fetchProducts(status, limit = 250) {
     const products = [];
     let hasNextPage = true;
@@ -167,6 +194,9 @@ async function fetchProducts(status, limit = 250) {
 
     while (hasNextPage) {
         try {
+            // Check rate limit before making request
+            await checkRateLimit();
+
             const query = `
                 query($limit: Int!, $cursor: String) {
                     products(first: $limit, after: $cursor, query: "status:${status}") {
@@ -205,8 +235,20 @@ async function fetchProducts(status, limit = 250) {
 
             console.log('API Response:', JSON.stringify(response.data, null, 2));
 
-            // Check for GraphQL errors
             if (response.data.errors) {
+                const isThrottled = response.data.errors.some(error => 
+                    error.extensions?.code === 'THROTTLED'
+                );
+                
+                if (isThrottled) {
+                    // Add exponential backoff for throttled requests
+                    const delay = Math.min(1000 * Math.pow(2, retryCount) + Math.random() * 1000, 30000);
+                    console.log(`Throttled, waiting ${delay}ms before retry`);
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                    retryCount++;
+                    continue;  // Retry the same request
+                }
+                
                 throw new Error(`GraphQL Errors: ${JSON.stringify(response.data.errors)}`);
             }
 
@@ -221,7 +263,6 @@ async function fetchProducts(status, limit = 250) {
             const filteredProducts = productEdges
                 .map(edge => edge.node)
                 .filter(product => {
-                    // Only exclude products where automation is explicitly set to false
                     const automationValue = product.metafield?.value;
                     return automationValue !== 'false';
                 });
@@ -232,8 +273,12 @@ async function fetchProducts(status, limit = 250) {
             hasNextPage = productsData.pageInfo.hasNextPage;
             cursor = productEdges[productEdges.length - 1]?.cursor;
             
-            await new Promise(resolve => setTimeout(resolve, 500));
+            // Reset retry count on successful request
             retryCount = 0;
+            
+            // Add delay between successful requests
+            await new Promise(resolve => setTimeout(resolve, 1000));
+            
         } catch (error) {
             console.error('Error fetching products:', error);
             retryCount++;
@@ -248,61 +293,73 @@ async function fetchProducts(status, limit = 250) {
     return products;
 }
 
-
 async function updateProduct(productId, status) {
-  const mutation = `
-      mutation updateProduct($input: ProductInput!) {
-          productUpdate(input: $input) {
-              product {
-                  id
-                  status
-              }
-              userErrors {
-                  field
-                  message
-              }
-          }
-      }
-  `;
+    const mutation = `
+        mutation updateProduct($input: ProductInput!) {
+            productUpdate(input: $input) {
+                product {
+                    id
+                    status
+                }
+                userErrors {
+                    field
+                    message
+                }
+            }
+        }
+    `;
 
-  let retryCount = 0;
-  const MAX_RETRIES = 3;
+    let retryCount = 0;
+    const MAX_RETRIES = 3;
 
-  while (retryCount < MAX_RETRIES) {
-      try {
-          const response = await shopifyClient.post('', {
-              query: mutation,
-              variables: {
-                  input: {
-                      id: productId,
-                      status: status
-                  }
-              }
-          });
+    while (retryCount < MAX_RETRIES) {
+        try {
+            await checkRateLimit();  // Add rate limit check
 
-          if (response.data.errors) {
-              throw new Error(response.data.errors[0].message);
-          }
+            const response = await shopifyClient.post('', {
+                query: mutation,
+                variables: {
+                    input: {
+                        id: productId,
+                        status: status
+                    }
+                }
+            });
 
-          const { userErrors } = response.data.data.productUpdate;
-          if (userErrors && userErrors.length > 0) {
-              throw new Error(userErrors[0].message);
-          }
+            if (response.data.errors) {
+                const isThrottled = response.data.errors.some(error => 
+                    error.extensions?.code === 'THROTTLED'
+                );
+                
+                if (isThrottled) {
+                    const delay = Math.min(1000 * Math.pow(2, retryCount) + Math.random() * 1000, 30000);
+                    console.log(`Throttled, waiting ${delay}ms before retry`);
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                    retryCount++;
+                    continue;
+                }
+                
+                throw new Error(response.data.errors[0].message);
+            }
 
-          return response.data.data.productUpdate.product;
+            const { userErrors } = response.data.data.productUpdate;
+            if (userErrors && userErrors.length > 0) {
+                throw new Error(userErrors[0].message);
+            }
 
-      } catch (error) {
-          retryCount++;
-          if (retryCount === MAX_RETRIES) {
-              throw new Error(`Failed to update product after ${MAX_RETRIES} attempts: ${error.message}`);
-          }
-          // Exponential backoff
-          await new Promise(resolve => 
-              setTimeout(resolve, Math.pow(2, retryCount) * 1000)
-          );
-      }
-  }
+            return response.data.data.productUpdate.product;
+
+        } catch (error) {
+            retryCount++;
+            if (retryCount === MAX_RETRIES) {
+                throw new Error(`Failed to update product after ${MAX_RETRIES} attempts: ${error.message}`);
+            }
+            const delay = Math.pow(2, retryCount) * 1000;
+            await new Promise(resolve => setTimeout(resolve, delay));
+        }
+    }
 }
+
 function getTotalInventory(product) {
     if (!product.variants?.edges) {
         return 0;
@@ -313,6 +370,7 @@ function getTotalInventory(product) {
         return total + quantity;
     }, 0);
 }
+
 // Process products in batches
 async function processProductBatch(products, targetStatus) {
     const changes = [];
@@ -329,7 +387,6 @@ async function processProductBatch(products, targetStatus) {
                     automationEnabled: product.metafield?.value !== 'false'
                 });
 
-                // Skip processing if automation is explicitly disabled
                 if (product.metafield?.value === 'false') {
                     console.log(`Skipping product ${product.handle} - automation disabled`);
                     return;
@@ -379,7 +436,7 @@ async function processProductBatch(products, targetStatus) {
             }
         }));
 
-        await new Promise(resolve => setTimeout(resolve, 500));
+        await new Promise(resolve => setTimeout(resolve, 1000));  // Increase delay between batches
     }
 
     if (changes.length > 0) {
