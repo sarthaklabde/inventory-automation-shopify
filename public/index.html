@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Shopify Automation Monitor</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="Monitor Shopify product automation status and logs">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/axios/1.6.7/axios.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-100">
+    <div class="container mx-auto px-4 py-8">
+        <header class="flex justify-between items-center mb-8">
+            <h1 class="text-3xl font-bold">Shopify Automation Monitor</h1>
+            <div class="flex gap-4 items-center">
+                <select id="timezoneSelect" class="border rounded px-3 py-2">
+                    <!-- Timezones will be populated via JavaScript -->
+                </select>
+                <button onclick="refreshData()" class="bg-blue-500 hover:bg-blue-600 text-white px-4 py-2 rounded">
+                    Refresh Data
+                </button>
+            </div>
+        </header>
+        
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-8">
+            <!-- Recent Product Changes -->
+            <div class="bg-white rounded-lg shadow p-6">
+                <h2 class="text-xl font-semibold mb-4">Product Status Changes (Last 24h)</h2>
+                <div class="overflow-x-auto">
+                    <table class="min-w-full">
+                        <thead>
+                            <tr class="border-b">
+                                <th class="text-left py-2">Product</th>
+                                <th class="text-left py-2">Status Change</th>
+                                <th class="text-left py-2">Time</th>
+                            </tr>
+                        </thead>
+                        <tbody id="productChangesTable">
+                            <!-- Product changes will be inserted here -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Logs -->
+            <div class="bg-white rounded-lg shadow p-6">
+                <h2 class="text-xl font-semibold mb-4">Recent Logs</h2>
+                <div id="logsContainer" class="overflow-y-auto max-h-[600px]">
+                    <!-- Logs will be inserted here -->
+                </div>
+            </div>
+        </div>
+
+        <!-- Current time display -->
+        <div class="mt-4 text-sm text-gray-600">
+            Current time: <span id="currentTime"></span>
+        </div>
+    </div>
+
+    <script>
+        // Common timezones list with more Asian options
+        const commonTimezones = [
+            { value: 'UTC', label: 'UTC' },
+            { value: 'Asia/Kolkata', label: 'India (IST)' },
+            { value: 'Asia/Dubai', label: 'Dubai (GST)' },
+            { value: 'Asia/Singapore', label: 'Singapore (SGT)' },
+            { value: 'Asia/Tokyo', label: 'Tokyo (JST)' },
+            { value: 'America/New_York', label: 'New York (EST/EDT)' },
+            { value: 'America/Los_Angeles', label: 'Los Angeles (PST/PDT)' },
+            { value: 'Europe/London', label: 'London (GMT/BST)' },
+            { value: 'Europe/Paris', label: 'Paris (CET/CEST)' },
+            { value: 'Australia/Sydney', label: 'Sydney (AEST/AEDT)' }
+        ];
+
+        // Populate timezone dropdown
+        function populateTimezones() {
+            const select = document.getElementById('timezoneSelect');
+            
+            // Add detected timezone as first option
+            const detectedTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+            const detectedOption = document.createElement('option');
+            detectedOption.value = detectedTimezone;
+            detectedOption.textContent = `${detectedTimezone} (Local)`;
+            select.appendChild(detectedOption);
+            
+            // Add separator
+            const separator = document.createElement('option');
+            separator.disabled = true;
+            separator.textContent = '──────────';
+            select.appendChild(separator);
+            
+            // Add common timezones
+            commonTimezones.forEach(tz => {
+                if (tz.value !== detectedTimezone) {
+                    const option = document.createElement('option');
+                    option.value = tz.value;
+                    option.textContent = tz.label;
+                    select.appendChild(option);
+                }
+            });
+        }
+
+        function formatDate(dateString) {
+            const date = new Date(dateString);
+            const timezone = document.getElementById('timezoneSelect').value;
+            
+            return new Intl.DateTimeFormat(undefined, {
+                year: 'numeric',
+                month: 'short',
+                day: 'numeric',
+                hour: '2-digit',
+                minute: '2-digit',
+                second: '2-digit',
+                hour12: true,
+                timeZone: timezone,
+                timeZoneName: 'short'
+            }).format(date);
+        }
+
+        function updateCurrentTime() {
+            const currentTimeElement = document.getElementById('currentTime');
+            const timezone = document.getElementById('timezoneSelect').value;
+            
+            const now = new Date();
+            currentTimeElement.textContent = new Intl.DateTimeFormat(undefined, {
+                hour: '2-digit',
+                minute: '2-digit',
+                second: '2-digit',
+                hour12: true,
+                timeZone: timezone,
+                timeZoneName: 'short'
+            }).format(now);
+        }
+
+        function formatStatus(status) {
+            if (!status) return 'Unknown';
+            return status.charAt(0) + status.slice(1).toLowerCase();
+        }
+
+        function getStatusColor(status) {
+            switch (status) {
+                case 'ACTIVE':
+                    return 'text-green-600';
+                case 'DRAFT':
+                    return 'text-gray-600';
+                default:
+                    return 'text-gray-400';
+            }
+        }
+
+        function renderProductChanges(changes) {
+            const tbody = document.getElementById('productChangesTable');
+            
+            if (!changes || changes.length === 0) {
+                tbody.innerHTML = `
+                    <tr class="border-b">
+                        <td colspan="3" class="py-4 text-center text-gray-500">No status changes in the last 24 hours</td>
+                    </tr>`;
+                return;
+            }
+
+            tbody.innerHTML = changes.map(change => {
+                const fromStatusClass = getStatusColor(change.from_status);
+                const toStatusClass = getStatusColor(change.to_status);
+                
+                return `
+                    <tr class="border-b hover:bg-gray-50">
+                        <td class="py-2"><a href="#" target="_blank">${change.handle || 'Unknown Product'}</a></td>
+                        <td class="py-2">
+                            <span class="inline-flex items-center">
+                                <span class="${fromStatusClass}">
+                                    ${formatStatus(change.from_status)}
+                                </span>
+                                <span class="mx-2">→</span>
+                                <span class="${toStatusClass}">
+                                    ${formatStatus(change.to_status)}
+                                </span>
+                            </span>
+                        </td>
+                        <td class="py-2 text-gray-600">${formatDate(change.timestamp)}</td>
+                    </tr>
+                `;
+            }).join('');
+        }
+
+        function renderLogs(logs) {
+            const container = document.getElementById('logsContainer');
+            
+            if (!logs || logs.length === 0) {
+                container.innerHTML = `
+                    <div class="py-4 text-center text-gray-500">
+                        No logs available
+                    </div>`;
+                return;
+            }
+
+            container.innerHTML = logs.map(log => `
+                <div class="py-2 border-b ${log.type === 'error' ? 'text-red-600' : ''} hover:bg-gray-50">
+                    <span class="text-sm text-gray-500">${formatDate(log.timestamp)}</span>
+                    <p class="mt-1">${log.message}</p>
+                </div>
+            `).join('');
+        }
+
+        async function refreshData() {
+            try {
+                const response = await axios.get('/api/data');
+                console.log('Received data:', response.data); // Debug log
+                renderProductChanges(response.data.recentChanges);
+                renderLogs(response.data.logs);
+                updateCurrentTime();
+            } catch (error) {
+                console.error('Error fetching data:', error);
+                // Show error in UI
+                document.getElementById('productChangesTable').innerHTML = `
+                    <tr class="border-b">
+                        <td colspan="3" class="py-4 text-center text-red-500">Error loading data</td>
+                    </tr>`;
+                document.getElementById('logsContainer').innerHTML = `
+                    <div class="py-4 text-center text-red-500">
+                        Error loading logs
+                    </div>`;
+            }
+        }
+
+        // Initialize timezone selector
+        populateTimezones();
+
+        // Add event listener for timezone changes
+        document.getElementById('timezoneSelect').addEventListener('change', () => {
+            refreshData();
+        });
+
+        // Initial load
+        refreshData();
+
+        // Update current time every second
+        setInterval(updateCurrentTime, 1000);
+
+        // Auto refresh data every 60 seconds
+        setInterval(refreshData, 60000);
+    </script>
+</body>
+</html>
